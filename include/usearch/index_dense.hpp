@@ -402,15 +402,15 @@ class index_dense_gt {
 
     using serialization_config_t = index_dense_serialization_config_t;
 
-    using dynamic_allocator_t = aligned_allocator_gt<byte_t, 64>;
-    using tape_allocator_t = memory_mapping_allocator_gt<64>;
+    using dynamic_allocator_t = aligned_allocator_gt<byte_t, 32>;
+    using tape_allocator_t = memory_mapping_allocator_gt<32>;
 
   private:
     /// @brief Punned index.
     using index_t = index_gt<                        //
         distance_t, vector_key_t, compressed_slot_t, //
         dynamic_allocator_t, tape_allocator_t>;
-    using index_allocator_t = aligned_allocator_gt<index_t, 64>;
+    using index_allocator_t = aligned_allocator_gt<index_t, 32>;
 
     using member_iterator_t = typename index_t::member_iterator_t;
     using member_citerator_t = typename index_t::member_citerator_t;
@@ -453,13 +453,13 @@ class index_dense_gt {
     /// @brief Allocator for the copied vectors, aligned to widest double-precision scalars.
     vectors_tape_allocator_t vectors_tape_allocator_;
 
-    using vectors_lookup_allocator_t = aligned_allocator_gt<byte_t*, 64>;
+    using vectors_lookup_allocator_t = aligned_allocator_gt<byte_t*, 32>;
     using vectors_lookup_t = buffer_gt<byte_t*, vectors_lookup_allocator_t>;
 
     /// @brief For every managed `compressed_slot_t` stores a pointer to the allocated vector copy.
     mutable vectors_lookup_t vectors_lookup_;
 
-    using available_threads_allocator_t = aligned_allocator_gt<std::size_t, 64>;
+    using available_threads_allocator_t = aligned_allocator_gt<std::size_t, 32>;
     using available_threads_t = ring_gt<std::size_t, available_threads_allocator_t>;
 
     /// @brief Originally forms and array of integers [0, threads], marking all as available.

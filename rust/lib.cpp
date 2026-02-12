@@ -202,6 +202,12 @@ std::unique_ptr<NativeIndex> wrap(index_t&& index) {
     return result;
 }
 
+void usearch_set_allocator(uptr_t alloc_fn, uptr_t free_fn) {
+    auto alloc = reinterpret_cast<usearch::usearch_alloc_fn_t>(alloc_fn);
+    auto dealloc = reinterpret_cast<usearch::usearch_free_fn_t>(free_fn);
+    usearch::set_allocator(alloc, dealloc);
+}
+
 std::unique_ptr<NativeIndex> new_native_index(IndexOptions const& options) {
     metric_kind_t metric_kind = rust_to_cpp_metric(options.metric);
     scalar_kind_t scalar_kind = rust_to_cpp_scalar(options.quantization);

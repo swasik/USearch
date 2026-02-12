@@ -94,3 +94,4 @@ class NativeIndex {
 };
 
 std::unique_ptr<NativeIndex> new_native_index(IndexOptions const& options);
+void usearch_set_allocator(uptr_t alloc_fn, uptr_t free_fn);

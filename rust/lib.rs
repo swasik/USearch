@@ -246,6 +246,10 @@ impl std::fmt::Debug for f16 {
     }
 }
 
+// The CXX macro generates `#[automatically_derived]` on inherent impl blocks,
+// but Rust only allows that attribute on trait impl blocks. Suppress the resulting
+// `unused_attributes` warnings until this is fixed upstream in the `cxx` crate.
+#[allow(unused_attributes)]
 #[cxx::bridge]
 pub mod ffi {
 
@@ -336,6 +340,7 @@ pub mod ffi {
         pub fn change_metric(self: &NativeIndex, metric: usize, metric_state: usize);
 
         pub fn new_native_index(options: &IndexOptions) -> Result<UniquePtr<NativeIndex>>;
+        pub fn usearch_set_allocator(alloc_fn: usize, free_fn: usize);
         pub fn reserve(self: &NativeIndex, capacity: usize) -> Result<()>;
         pub fn reserve_capacity_and_threads(
             self: &NativeIndex,
@@ -1431,6 +1436,62 @@ pub fn new_index(options: &ffi::IndexOptions) -> Result<Index, cxx::Exception> {
     Index::new(options)
 }
 
+/// Type for custom aligned allocation functions used by USearch internally.
+/// # Parameters
+/// * `size` - Number of bytes to allocate.
+/// * `alignment` - Required alignment in bytes (always a power of 2).
+/// # Returns
+/// A pointer to allocated memory, or null on failure.
+pub type AllocFn = extern "C" fn(size: usize, alignment: usize) -> *mut u8;
+
+/// Type for custom deallocation functions used by USearch internally.
+/// # Parameters
+/// * `ptr` - Pointer to memory to free.
+/// * `size` - Size of the allocation in bytes.
+/// * `alignment` - Alignment of the allocation in bytes.
+pub type DeallocFn = extern "C" fn(ptr: *mut u8, size: usize, alignment: usize);
+
+/// Sets the global memory allocator used by USearch for all internal aligned allocations.
+///
+/// This must be called **before** creating any `Index` instances. Calling it while
+/// indices are alive leads to undefined behavior (mixing allocators).
+///
+/// Pass `None` to restore the default OS allocator.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use usearch::{set_allocator, AllocFn, DeallocFn};
+///
+/// extern "C" fn my_alloc(size: usize, alignment: usize) -> *mut u8 {
+///     // custom allocation logic
+///     # std::ptr::null_mut()
+/// }
+///
+/// extern "C" fn my_dealloc(ptr: *mut u8, size: usize, alignment: usize) {
+///     // custom deallocation logic
+/// }
+///
+/// unsafe { set_allocator(Some(my_alloc), Some(my_dealloc)); }
+/// ```
+///
+/// # Safety
+///
+/// The provided functions must be valid allocator implementations that return
+/// properly aligned memory. The caller must ensure no existing indices were
+/// allocated with a different allocator.
+pub unsafe fn set_allocator(alloc: Option<AllocFn>, dealloc: Option<DeallocFn>) {
+    let alloc_ptr = match alloc {
+        Some(f) => f as usize,
+        None => 0,
+    };
+    let dealloc_ptr = match dealloc {
+        Some(f) => f as usize,
+        None => 0,
+    };
+    ffi::usearch_set_allocator(alloc_ptr, dealloc_ptr);
+}
+
 #[cfg(test)]
 mod tests {
     use crate::ffi::IndexOptions;
@@ -1443,6 +1504,24 @@ mod tests {
     use crate::Key;
 
     use std::env;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Tracks the number of allocations routed through the custom allocator.
+    static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    /// Tracks the number of deallocations routed through the custom allocator.
+    static DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn mimalloc_alloc(size: usize, alignment: usize) -> *mut u8 {
+        ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        let layout = std::alloc::Layout::from_size_align(size, alignment).unwrap();
+        unsafe { std::alloc::GlobalAlloc::alloc(&mimalloc::MiMalloc, layout) }
+    }
+
+    extern "C" fn mimalloc_dealloc(ptr: *mut u8, size: usize, alignment: usize) {
+        DEALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        let layout = std::alloc::Layout::from_size_align(size, alignment).unwrap();
+        unsafe { std::alloc::GlobalAlloc::dealloc(&mimalloc::MiMalloc, ptr, layout) }
+    }
 
     #[test]
     fn print_specs() {
@@ -2034,5 +2113,70 @@ mod tests {
             search_results.iter().all(|&x| x),
             "All searches should find exact matches"
         );
+    }
+
+    /// This test verifies the custom allocator API works end-to-end with MiMalloc.
+    /// It is `#[ignore]` because it mutates process-global allocator state, which is
+    /// unsafe to do while other tests are running in parallel.
+    /// Run explicitly with: `cargo test test_mimalloc_allocator -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn test_mimalloc_allocator() {
+        // Reset counters
+        ALLOC_COUNT.store(0, Ordering::Relaxed);
+        DEALLOC_COUNT.store(0, Ordering::Relaxed);
+
+        // Set mimalloc as the allocator for USearch
+        unsafe {
+            crate::set_allocator(Some(mimalloc_alloc), Some(mimalloc_dealloc));
+        }
+
+        // Create an index — this should use mimalloc for internal allocations
+        let options = IndexOptions {
+            dimensions: 8,
+            metric: MetricKind::L2sq,
+            quantization: ScalarKind::F32,
+            ..Default::default()
+        };
+        let index = Index::new(&options).unwrap();
+        index.reserve(100).unwrap();
+
+        // Add vectors to trigger allocations
+        for i in 0..50u64 {
+            let vector: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32 * 0.01).collect();
+            index.add(i, &vector).unwrap();
+        }
+
+        // Search to verify the index works correctly with the custom allocator
+        let query: Vec<f32> = vec![0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07];
+        let results = index.search(&query, 5).unwrap();
+        assert_eq!(results.keys.len(), 5);
+        assert_eq!(results.keys[0], 0, "Closest vector should be key 0");
+
+        let allocs = ALLOC_COUNT.load(Ordering::Relaxed);
+        let deallocs = DEALLOC_COUNT.load(Ordering::Relaxed);
+        println!(
+            "MiMalloc allocator: {} allocations, {} deallocations",
+            allocs, deallocs
+        );
+        assert!(
+            allocs > 0,
+            "Expected at least one allocation through mimalloc, got {}",
+            allocs
+        );
+
+        // Reset and verify deallocs fire
+        index.reset().unwrap();
+        drop(index);
+        let final_deallocs = DEALLOC_COUNT.load(Ordering::Relaxed);
+        assert!(
+            final_deallocs > deallocs,
+            "Expected deallocations after dropping the index"
+        );
+
+        // Restore default allocator
+        unsafe {
+            crate::set_allocator(None, None);
+        }
     }
 }

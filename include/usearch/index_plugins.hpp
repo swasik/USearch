@@ -790,10 +790,56 @@ using executor_default_t = executor_stl_t;
 #endif
 
 /**
+ *  @brief  Type for custom aligned allocation functions.
+ *  @param[in] size Number of bytes to allocate.
+ *  @param[in] alignment Required alignment in bytes.
+ *  @return Pointer to allocated memory, or `nullptr` on failure.
+ */
+using usearch_alloc_fn_t = void* (*)(std::size_t size, std::size_t alignment);
+
+/**
+ *  @brief  Type for custom deallocation functions.
+ *  @param[in] ptr Pointer to memory to free.
+ *  @param[in] size Size of the allocation in bytes.
+ *  @param[in] alignment Alignment of the allocation in bytes.
+ */
+using usearch_free_fn_t = void (*)(void* ptr, std::size_t size, std::size_t alignment);
+
+/**
+ *  @brief  Returns a reference to the global custom allocator function pointer.
+ *          When non-null, `aligned_allocator_gt` will use this instead of system calls.
+ */
+inline usearch_alloc_fn_t& global_alloc_fn() {
+    static usearch_alloc_fn_t fn = nullptr;
+    return fn;
+}
+
+/**
+ *  @brief  Returns a reference to the global custom deallocator function pointer.
+ *          When non-null, `aligned_allocator_gt` will use this instead of system calls.
+ */
+inline usearch_free_fn_t& global_free_fn() {
+    static usearch_free_fn_t fn = nullptr;
+    return fn;
+}
+
+/**
+ *  @brief  Sets the global memory allocator used by USearch for aligned allocations.
+ *          Must be called before creating any index instances.
+ *  @param[in] alloc_fn Custom allocation function, or `nullptr` to restore defaults.
+ *  @param[in] free_fn Custom deallocation function, or `nullptr` to restore defaults.
+ */
+inline void set_allocator(usearch_alloc_fn_t alloc_fn, usearch_free_fn_t free_fn) {
+    global_alloc_fn() = alloc_fn;
+    global_free_fn() = free_fn;
+}
+
+/**
  *  @brief  Uses OS-specific APIs for aligned memory allocations.
  *          Available since C11, but only C++17, so we wrap the C version.
+ *          When global allocator hooks are set via `set_allocator`, uses those instead.
  */
-template <typename element_at = char, std::size_t alignment_ak = 64> //
+template <typename element_at = char, std::size_t alignment_ak = 32> //
 class aligned_allocator_gt {
   public:
     using value_type = element_at;
@@ -812,6 +858,10 @@ class aligned_allocator_gt {
         if (length > length_bytes)
             return nullptr;
         std::size_t alignment = alignment_ak;
+        // Use global allocator hooks if set
+        usearch_alloc_fn_t custom_alloc = global_alloc_fn();
+        if (custom_alloc)
+            return (pointer)custom_alloc(length_bytes, alignment);
 #if defined(USEARCH_DEFINED_WINDOWS)
         return (pointer)_aligned_malloc(length_bytes, alignment);
 #elif defined(USEARCH_DEFINED_APPLE) || defined(USEARCH_DEFINED_ANDROID)
@@ -825,7 +875,14 @@ class aligned_allocator_gt {
 #endif
     }
 
-    void deallocate(pointer begin, size_type) const {
+    void deallocate(pointer begin, size_type length) const {
+        // Use global deallocator hooks if set
+        usearch_free_fn_t custom_free = global_free_fn();
+        if (custom_free) {
+            std::size_t length_bytes = alignment_ak * divide_round_up<alignment_ak>(length * sizeof(value_type));
+            custom_free((void*)begin, length_bytes, alignment_ak);
+            return;
+        }
 #if defined(USEARCH_DEFINED_WINDOWS)
         _aligned_free(begin);
 #else
